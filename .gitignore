@@ -1,0 +1,6 @@
+﻿codealike.json
+*.DotSettings.user
+*.ncrunchsolution.user
+bin/
+obj/
+.vs/
