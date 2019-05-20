@@ -57,7 +57,9 @@ function Install-WinFeature($name) {
     Write-Verbose "Installing Windows Feature $name and dependencies...DONE" -Verbose
 }
 
-function Install-IIS() {
+function Install-IIS {
+    [CmdletBinding()]
+    Param()
     Install-WinFeature "IIS-WebServer"
     Install-WinFeature "IIS-ASPNET45"
     Install-WinFeature "IIS-WebServerRole"
@@ -79,6 +81,15 @@ function Install-IIS() {
     Write-Verbose "Installing Web Platform Installer..."
     & "C:\Program Files\Microsoft\Web Platform Installer\WebpiCmd-x64.exe" /install /Products:WDeployNoSMO /AcceptEULA /SuppressPostFinish
     Write-Verbose "Installing Web Platform Installer...DONE" -Verbose
+}
+
+function Install-HyperV {
+    [CmdletBinding()]
+    Param()
+    Write-Verbose "Installing Windows components for HyperV and containers..."
+    Install-WinFeature "Containers"
+    Install-WinFeature "Microsoft-Hyper-V-All"
+    Write-Verbose "Installing Windows components for HyperV and containers...DONE"
 }
 
 $WebManager = Get-IISServerManager
@@ -137,7 +148,7 @@ function New-AppPool {
 }
 
 function New-Website {
-    [CmdletBinding(SupportsShouldProcess = $true)]
+    [CmdletBinding()]
     Param(
         [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
         [String]
@@ -673,4 +684,510 @@ function Invoke-XdtTransform {
     Write-Verbose "$WebConfigDestinationPath transformed successfully via file $TransformFile"
 }
 
+Enum NetFrameworkVersions {
+    NET45 = 378389
+    NET451 = 378758
+    NET451ALT = 378675
+    NET452 = 379893
+    NET46 = 393295
+    NET46ALT = 393297
+    NET461 = 394254
+    NET461ALT = 394271
+    NET462 = 394802
+    NET462ALT = 394806
+    NET47 = 460798
+    NET47ALT = 460805
+    NET471 = 461308
+    NET471ALT = 461310
+    NET472 = 461808
+    NET472ALT = 461814
+    NET48 = 528040
+    NET48ALT = 528049
+}
 
+Enum NetFrameworkMinimumVersions {
+    NET45 = 378389
+    NET451 = 378675
+    NET452 = 379893
+    NET46 = 3932945
+    NET461 = 394254
+    NET462 = 394802
+    NET47 = 460798
+    NET471 = 461308
+    NET472 = 461808
+    NET48 = 528040
+}
+
+function Get-RegistryKey {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType Container })]
+        $KeyPath
+    )
+    Process {
+        Get-Item -Path $KeyPath | Select-Object -ExpandProperty Property
+    }
+}
+
+function Confirm-EmptyDirectory {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType Container})]
+        $Directory
+    )
+    Process {
+        (GetChildItem -Path "$KeyPath\*" -Force |
+            Select-Object -First 1 |
+            Measure-Object).Count -eq 0
+    }
+}
+
+function Test-CommandInPath {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateNotNullOrEmpty()]
+        $Command
+    )
+    Process {
+        $null -ne (Get-Command -Name $Command -ErrorAction SilentlyContinue)
+    }
+}
+
+function Test-ProgramVersion {
+    [OutputType([bool])]
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateNotNullOrEmpty()]
+        $Command,
+        [Parameter(Mandatory = $true, Position = 1)]
+        [string]
+        [ValidateScript({ $_ -as [version] })]
+        $MinVersion
+    )
+    Process {
+        $cmd = Get-Command -Name $Command -ErrorAction SilentlyContinue
+
+        if ($null -eq $cmd) { return $false }
+
+        $currentVersion = $cmd.Version
+        $reqdVersion = [version]$MinVersion
+
+        $currentVersion -ge $reqdVersion
+    }
+}
+
+Enum MatchType {
+    Exact = 0
+    StartsWith = 1
+    EndsWith = 2
+    Contains = 3
+}
+function Get-InstalledProgram {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true, ParameterSetName = "ByName")]
+        [string]
+        [ValidateNotNullOrEmpty()]
+        $ProgramName,
+        [Parameter(Mandatory = $false, Position = 1, ValueFromPipelineByPropertyName = $true, ParameterSetName = "ByName")]
+        [MatchType]
+        $MatchStyle = [MatchType]::Exact,
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true, ParameterSetName = "ByInstallId")]
+        [string]
+        [ValidateScript({ $_ -as [System.Guid]})]
+        $ProgramId
+    )
+    Process {
+        if ($ProgramId) {
+            switch ($MatchStyle) {
+                [MatchType]::Exact { Get-WmiObject -Class Win32_Product -ComputerName . |
+                                    Where-Object -FilterScript { $_.Name -eq $ProgramName}}
+                [MatchType]::StartsWith { Get-WmiObject -Class Win32_Product -ComputerName . |
+                                    Where-Object -FilterScript { $_.Name -like "$ProgramName*"}}
+                [MatchType]::EndsWith { Get-WmiObject -Class Win32_Product -ComputerName . |
+                                    Where-Object -FilterScript { $_.Name -like "*$ProgramName" }}
+                [MatchType]::ContainsWith { Get-WmiObject -Class Win32_Product -ComputerName . |
+                                    Where-Object -FilterScript { $_.Name -like "*$ProgramName*" }}
+        }
+    }
+        else {
+            Get-WmiObject -Class Win32_Product -ComputerName . |
+                Where-Object -FilterScript { $_.IdentifyingNumber -eq $ProgramId}
+        }
+    }
+}
+
+function Remove-Program {
+    [CmdletBinding()]
+    Param(
+        [ParameterAttribute(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [PSObject]
+        [ValidateScript({$null -ne $_ -and $_ -as [Win32_Product] })]
+        $Program
+    )
+}
+
+function Copy-Folder {
+    [CmdletBinding()]
+    Param(
+        [ParameterAttribute(Mandatory = $true, Position = 0, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType Container})]
+        $SourceDirectory,
+        [ParameterAttribute(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType Container -IsValid})]
+        $DestinationDirectory,
+        [ParameterAttribute(Mandatory = $false, Position = 2, ValueFromPipelineByPropertyName = $true)]
+        [switch]
+        $Overwrite
+    )
+    Process {
+        Copy-Item -Path $SourceDirectory -Recurse -Force:$Overwrite -Destination $DestinationDirectory
+    }
+}
+
+function Copy-File {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType Leaf})]
+        $SourceFile,
+        [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType Container -IsValid})]
+        $DestinationDirectory,
+        [Parameter(Mandatory = $false, Position = 2, ValueFromPipelineByPropertyName = $true)]
+        [switch]
+        $Overwrite
+    )
+    Process {
+        Copy-Item -Path $SourceFile -Force:$Overwrite -Destination $DestinationDirectory
+    }
+}
+
+function Restart-Process {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({ (Get-Process -Name $_ | Selet-Object -First 1 | Measure-Object).Count -gt 0})]
+        $ProcessName
+    )
+    Process {
+        $Process = Get-Process -Name $ProcessName
+        $id = $Process.Id
+        $commandLine = (Get-WmiObject -Class Win32_Process -Filter "Handle=$id").$commandLine
+        $path = $commandLine.Split(' ')[0]
+        $arguments = $commandLine.Split(' ')[1]
+
+        $Process.Kill()
+        $Process.WaitForExit()
+
+        Start-Process -FilePath $path -ArgumentList $arguments
+    }
+}
+
+function Test-Url {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateNotNullOrEmpty()]
+        $Url
+    )
+    Process {
+        $parsedUrl = $null
+        if ([System.Uri]::TryCreate($Url, 'Absolute', $parsedUrl)) {
+            $parsedUrl.Scheme -match 'http[s]?'
+        }
+        $false
+    }
+}
+
+function Invoke-Download {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateScript({ Test-Url -Url $_ })]
+        $Url,
+        [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -IsValid -PathType Leaf})]
+        $Destination
+    )
+    Begin {
+        $ProgressPreference = SilentlyContinue
+    }
+    Process {
+        Invoke-WebRequest -Method Get -OutFile $Destination -PassThru -Uri $Url -UseBasicParsing
+    }
+    End {
+        $ProgressPreference = Continue
+    }
+}
+
+function Clear-FolderContents {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType Container})]
+        $Directory
+    )
+    Process {
+        $Size = (Get-ChildItem $Directory | Measure-Object -Property Length -Sum).Sum
+        Get-ChildItem $Directory | Remove-Item -Force -ErrorAction SilentlyContinue -Recurse
+        Write-Verbose "Removed ${Size:0.0} MB from $Directory"
+    }
+}
+
+function Set-FileExtension {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType Leaf })]
+        $File,
+        [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateNotNullOrEmpty]
+        $NewExtension
+    )
+    Process {
+        if (-not $File.StartsWith(".", [System.StringComparison]::InvariantCultureIgnoreCase)) {
+            $File = ".$File"
+        }
+        $newFile = [System.IO.Path]::ChangeExtension($File, $NewExtension)
+        $newFile
+    }
+}
+
+function Invoke-DisposableScope {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [object]
+        [ValidateScript({ $null -ne $_ -and $_ -is [System.IDisposable]})]
+        $Resource,
+        [Parameter(Mandatory = $true, Position = 1)]
+        [scriptblock]
+        $ScopeScript
+    )
+    Process {
+        try {
+            . $ScopeScript
+        }
+        finally {
+            if ($null -ne $Resource) {
+                $Resource.Dispose()
+            }
+        }
+    }
+}
+function Get-WebPageContent {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({ Test-Url -Url $_ })]
+        $PageUrl
+    )
+    Process {
+        . Invoke-DisposableScope ($webClient = New-Object System.Net.WebClient) {
+            $webClient.DownloadString($PageUrl)
+        }
+    }
+}
+
+function Get-WebPageLinks {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({ Test-Url -Url $_ })]
+        $PageUrl,
+        [Parameter(Mandatory = $false)]
+        [switch]
+        $RunJavascript
+    )
+    Process {
+        (Invoke-WebRequest -UseBasicParsing:$RunJavascript -Uri $PageUrl).Links.Href
+    }
+}
+
+function Get-Profile {
+    [CmdletBinding()]
+    Param()
+    Process {
+        if (!(Test-Path -Path $profile -PathType leaf)) {
+            New-Item -Path $profile -ItemType 'file' -Force
+        }
+
+        Get-Content -Path $profile
+    }
+}
+
+function Add-ProfileData {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $profile -PathType leaf})]
+        $Data
+    )
+    Process {
+        $Commands | Add-Content -Path $profile
+    }
+}
+
+function Add-ContentToFile {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true, ParameterSetName = "AppendText")]
+        [string]
+        [ValidateNotNullOrEmpty()]
+        $AppendText,
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true, ParameterSetName = "AppendFile")]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType leaf })]
+        $AppendFile,
+        [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true, ParameterSetName = "AppendText")]
+        [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true, ParameterSetName = "AppendFile")]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType leaf -IsValid})]
+        $DestinationFile
+    )
+    Process {
+        if (!(Test-Path -Path $DestinationFile -PathType leaf)) {
+            New-Item -Path $DestinationFile -ItemType File
+        }
+
+        if ($AppendText) {
+            Add-Content -Path $DestinationFile -Value $AppendText
+        }
+        else {
+            Get-Content -Path $AppendFile | Add-Content -Path $DestinationFile
+        }
+    }
+}
+
+function Send-FormEncodedPost {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [hashtable]
+        [ValidateNotNullOrEmpty()]
+        $FormData,
+        [Parameter(Mandatory = $true, Position = 1)]
+        [string]
+        [ValidateScript({ Test-Url -Url $_})]
+        $PostUrl,
+        [Parameter(Mandatory = $false)]
+        [hashtable]
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        $Headers,
+        [Parameter(Mandatory = $false)]
+        [securestring]
+        [AllowEmptyString()]
+        [AllowNull()]
+        $BearerToken
+    )
+    Process {
+        $requestData = @{
+            Method = Post
+            Uri = $PostUrl
+            SslProtocol = Tls12
+            Form = FormData
+            TimeoutSec = 30
+            MaximumRetryCount = 3
+        }
+
+        if ($null -ne $Headers -and $Headers.Count -gt 0) {
+            $requestData.Headers = $Headers
+        }
+        if ($null -ne $BearerToken) {
+            $requestData.Token = $BearerToken
+            $requestData.Authentication = OAuth
+        }
+
+        Invoke-RestMethod @requestData
+    }
+}
+
+enum UpdateBehavior {
+    Upsert = 0
+    Prepend = 1
+    Append = 2
+    Replace = 3
+    SetIfMissing = 4
+}
+
+function Update-EnvironmentVariable {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateNotNullOrEmpty()]
+        $VariableName,
+        [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateNotNullOrEmpty()]
+        $Value,
+        [Parameter(Mandatory = $false, Position = 2, ValueFromPipelineByPropertyName = $true)]
+        [UpdateBehavior]
+        $UpdateStrategy = [UpdateBehavior]::Upsert,
+        [Parameter(Mandatory = $false, Position = 3, ValueFromPipelineByPropertyName = $true)]
+        [System.EnvironmentVariableTarget]
+        $VariableType = [System.EnvironmentVariableTarget]::Process
+    )
+    Process {
+        $currentValue = [System.Environment]::GetEnvironmentVariable($VariableName, $VariableType)
+
+        switch ($UpdateStrategy) {
+            ([UpdateBehavior]::Upsert) {
+                [System.Environment]::SetEnvironmentVariable($VariableName, $Value, $VariableType)
+            }
+            ([UpdateBehavior]::Prepend) {
+                if ($null -eq $currentValue) {
+                    Write-Error "$VariableName could not be set to value $Value in $VariableType scope because it does not exist."
+                    return
+                }
+                [System.Environment]::SetEnvironmentVariable($VariableName, "$Value$currentValue", $VariableType)
+            }
+            ([UpdateBehavior]::Append) {
+                if ($null -eq $currentValue) {
+                    Write-Error "$VariableName could not be set to value $Value in $VariableType scope because it does not exist."
+                    return
+                }
+                [System.Environment]::SetEnvironmentVariable($VariableName, "$currentValue$Value", $VariableType)
+            }
+            ([UpdateBehavior]::Replace) {
+                if ($null -eq $currentValue) {
+                    Write-Error "$VariableName could not be set to value $Value in $VariableType scope because it does not exist."
+                    return
+                }
+                [System.Environment]::SetEnvironmentVariable($VariableName, "$Value", $VariableType)
+            }
+            ([UpdateBehavior]::SetIfMissing) {
+                if ($null -eq $currentValue) {
+                    [System.Environment]::SetEnvironmentVariable($VariableName, $Value, $VariableType)
+                    return
+                }
+                Write-Error "$VariableName in scope $VariableType already exists and will not be set."
+            }
+        }
+    }
+
+}
