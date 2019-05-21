@@ -1,4 +1,4 @@
-#Requires -Version 5.0
+#Requires -Version 5.1
 #Requires -Modules PSReadLine, PowerShellGet, posh-git, IISAdministration, DockerMsftProvider, VSSetup, MSI, Pscx, Carbon
 #Requires -RunAsAdministrator
 
@@ -13,83 +13,180 @@ function Get-LatestModule {
         [String]
         [ValidateNotNullOrEmpty()]
         $Name,
-        [Parameter()]
-        [Boolean]
-        $AllowPrerelease=$false,
-        [Parameter()]
-        [Boolean]
-        $CanClobber=$false
+        [Parameter(Mandatory = $false)]
+        [switch]
+        $Prerelease,
+        [Parameter(Mandatory = $false)]
+        [switch]
+        $Clobber
     )
-    Write-Verbose "Attempting to install/update module $Name"
+    Process {
+        Write-Verbose "Attempting to install/update module $Name..."
 
-    if (-Not (Get-Module -ListAvailable -Name $Name)) {
-        Write-Verbose "Module $Name not found...installing"
-        Install-Module -Name $Name -Scope CurrentUser -AllowPrerelease:$AllowPrerelease -AllowClobber:$CanClobber
-        Write-Verbose "Module $Name installed successfully." -Verbose
-    }
-    else {
-        Write-Verbose "Module $Name already installed...checking for updates."
-        Update-Module -Name $Name -AllowPrerelease:$AllowPrerelease
-        Write-Verbose "Module $Name update check completed successfully." -Verbose
+        if ($null -eq (Get-Module -ListAvailable -Name $Name)) {
+            Write-Verbose "Module $Name not found...installing"
+            Install-Module -Name $Name -Scope CurrentUser -AllowPrerelease:$Prerelease -AllowClobber:$Clobber
+            Write-Verbose "Module $Name installed successfully."
+        }
+        else {
+            Write-Verbose "Module $Name already installed...checking for updates."
+            Update-Module -Name $Name -AllowPrerelease:$Prerelease
+            Write-Verbose "Module $Name update check completed successfully."
+        }
     }
 }
 
-function UpdateDependencies {
+
+
+function Sync-ProcessPath {
     [CmdletBinding()]
     Param()
-    Write-Verbose "Updating all required modules for script..."
-    Get-LatestModule -Name "PSReadLine"
-    Get-LatestModule -Name "PowerShellGet"
-    Get-LatestModule -Name "posh-git" -AllowPrerelease $true
-    Get-LatestModule -Name "IISAdministration" -AllowPrerelease $true
-    Get-LatestModule -Name "VSSetup" -AllowPrerelease $true
-    Get-LatestModule -Name "DockerMsftProvider" -AllowPrerelease $true
-    Get-LatestModule -Name "MSI" -AllowPrerelease $true
-    Get-LatestModule -Name "Pscx" -CanClobber $true
-    Get-LatestModule -Name "Carbon" -CanClobber $true
-    Write-Verbose "Updating all required modules for script...done. Please restart PowerShell"
+    Process {
+        Write-Verbose "Updating process module path data..."
+        $env:PSModulePath = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Session Manager\Environment' -Name PSModulePath).PSModulePath
+        Write-Verbose "Process module path data updated successfully to $env:PSModulePath"
+    }
 }
 
+function Update-Dependencies {
+    [CmdletBinding()]
+    Param()
+    Process {
+        Write-Verbose "Updating all required modules for script..."
+        Get-LatestModule -Name "PSReadLine"
+        Get-LatestModule -Name "PowerShellGet"
+        Get-LatestModule -Name "posh-git" -Prerelease
+        Get-LatestModule -Name "IISAdministration" -Prerelease
+        Get-LatestModule -Name "VSSetup" -Prerelease
+        Get-LatestModule -Name "DockerMsftProvider" -Prerelease
+        Get-LatestModule -Name "MSI" -Prerelease
+        Get-LatestModule -Name "Pscx" -Clobber
+        Get-LatestModule -Name "Carbon" -Clobber
+        Write-Verbose "Updating all required modules for script...done."
+        Sync-ProcessPath
+    }
+}
 
-function Install-WinFeature($name) {
-    Write-Verbose "Installing Windows Feature $name and dependencies..."
-    Enable-WindowsOptionalFeature -Online -FeatureName $name -All -NoRestart
-    Write-Verbose "Installing Windows Feature $name and dependencies...DONE" -Verbose
+function Get-RootedPath {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateNotNullOrEmpty()]
+        $Path
+    )
+    Process {
+        if (-not ([System.IO.Path]::IsPathRooted($Path))) {
+            $Path = Join-Path -Path $PSScriptRoot -ChildPath $Path
+        }
+
+        $Path
+    }
+}
+
+function Test-IsPoshScript {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path (Get-RootedPath -Path $_) -PathType Leaf })]
+        $Path
+    )
+    Process {
+        [System.IO.Path]::GetExtension($Path).Contains(".PS1", [StringComparison]::InvariantCultureIgnoreCase)
+    }
+}
+
+function Resume-AfterRestart {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({ Test-IsPoshScript -Path $_  })]
+        $ResumeScript
+    )
+    Process {
+        $taskTrigger = New-ScheduledTaskTrigger -AtStartup
+        $taskAction = New-ScheduledTaskAction -Execute Powershell.exe -Argument "-ExecutionPolicy Bypass -File $ResumeScript"
+        $taskUserId = New-ScheduledTaskPrincipal -UserId System -RunLevel Highest -LogonType ServiceAccount
+        Register-ScheduledTask -Force -TaskName RestartResumeScript -Action $taskAction -Principal $taskUserId -Trigger $taskTrigger
+    }
+}
+
+function Install-WinFeature {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [string]
+        [ValidateScript({$null -ne (Get-WindowsOptionalFeature -Online -FeatureName $_) })]
+        $Name
+    )
+    Process {
+        if ($null -eq (Get-WindowsOptionalFeature -Online -FeatureName $Name | Where-Object { $_.Status -eq 'Enabled' })) {
+            Write-Verbose "Installing Windows Feature $Name and dependencies..."
+            $result = Enable-WindowsOptionalFeature -Online -FeatureName $Name -All -NoRestart -WarningAction SilentlyContinueow
+            Write-Verbose "Installing Windows Feature $Name and dependencies...DONE"
+            if ($result.RestartNeeded) { 1 } else { 0 }
+        }
+    }
 }
 
 function Install-IIS {
     [CmdletBinding()]
     Param()
-    Install-WinFeature "IIS-WebServer"
-    Install-WinFeature "IIS-ASPNET45"
-    Install-WinFeature "IIS-WebServerRole"
-    Install-WinFeature "IIS-CommonHttpFeatures"
-    Install-WinFeature "IIS-HttpErrors"
-    Install-WinFeature "IIS-ApplicationDevelopment"
-    Install-WinFeature "IIS-HealthAndDiagnostics"
-    Install-WinFeature "IIS-HttpLogging"
-    Install-WinFeature "IIS-HttpTracing"
-    Install-WinFeature "WebServerManagementTools"
-    Install-WinFeature "IIS-StaticContent"
-    Install-WinFeature "IIS-WebSockets"
-    Install-WinFeature "IIS-ApplicationInit"
-    Install-WinFeature "Microsoft-Windows-NetFx4-US-OC-Package"
-    Install-WinFeature "IIS-NetFxExtensibility45"
-    Install-WinFeature "IIS-ISAPIExtensions"
-    Install-WinFeature "IIS-ISAPIFilter"
-    Install-WinFeature "IIS-HttpCompressionStatic"
-    Write-Verbose "Installing Web Platform Installer..."
-    & "C:\Program Files\Microsoft\Web Platform Installer\WebpiCmd-x64.exe" /install /Products:WDeployNoSMO /AcceptEULA /SuppressPostFinish
-    Write-Verbose "Installing Web Platform Installer...DONE" -Verbose
+    Process {
+        $restartReqd = 0
+        $restartReqd += Install-WinFeature "IIS-WebServer"
+        $restartReqd += Install-WinFeature "IIS-ASPNET"
+        $restartReqd += Install-WinFeature "IIS-ASPNET45"
+        $restartReqd += Install-WinFeature "IIS-WebServerRole"
+        $restartReqd += Install-WinFeature "IIS-CommonHttpFeatures"
+        $restartReqd += Install-WinFeature "IIS-HttpErrors"
+        $restartReqd += Install-WinFeature "IIS-HttpRedirect"
+        $restartReqd += Install-WinFeature "IIS-ApplicationDevelopment"
+        $restartReqd += Install-WinFeature "IIS-HealthAndDiagnostics"
+        $restartReqd += Install-WinFeature "IIS-HttpLogging"
+        $restartReqd += Install-WinFeature "IIS-HttpTracing"
+        $restartReqd += Install-WinFeature "IIS-WebServerManagementTools"
+        $restartReqd += Install-WinFeature "IIS-StaticContent"
+        $restartReqd += Install-WinFeature "IIS-WebSockets"
+        $restartReqd += Install-WinFeature "IIS-ApplicationInit"
+        $restartReqd += Install-WinFeature "IIS-ManagementConsole"
+        $restartReqd += Install-WinFeature "IIS-Security"
+        $restartReqd += Install-WinFeature "IIS-Performance"
+        $restartReqd += Install-WinFeature "NetFx4-AdvSrvs"
+        $restartReqd += Install-WinFeature "NetFx4Extended-ASPNET45"
+        $restartReqd += Install-WinFeature "Microsoft-Windows-NetFx4-US-OC-Package"
+        $restartReqd += Install-WinFeature 'Microsoft-Windows-NetFx4-WCF-US-OC-Package'
+        $restartReqd += Install-WinFeature "IIS-NetFxExtensibility45"
+        $restartReqd += Install-WinFeature "IIS-ISAPIExtensions"
+        $restartReqd += Install-WinFeature "IIS-ISAPIFilter"
+        $restartReqd += Install-WinFeature "IIS-HttpCompressionStatic"
+
+        Write-Verbose "Installing Web Platform Installer..."
+        & "C:\Program Files\Microsoft\Web Platform Installer\WebpiCmd-x64.exe" /install /Products:WDeployNoSMO /AcceptEULA /SuppressPostFinish
+        Write-Verbose "Installing Web Platform Installer...DONE" -Verbose
+
+        if ($restartReqd -gt 0) {
+            Resume-AfterRestart -ResumeScript "InitSites.ps1"
+        }
+    }
 }
 
 function Install-HyperV {
     [CmdletBinding()]
     Param()
-    Write-Verbose "Installing Windows components for HyperV and containers..."
-    Install-WinFeature "Containers"
-    Install-WinFeature "Microsoft-Hyper-V-All"
-    Write-Verbose "Installing Windows components for HyperV and containers...DONE"
+    Process {
+        $restartReqd = 0
+        Write-Verbose "Installing Windows components for HyperV and containers..."
+        $restartReqd += Install-WinFeature "Containers"
+        $restartReqd += Install-WinFeature "Microsoft-Hyper-V-All"
+        Write-Verbose "Installing Windows components for HyperV and containers...DONE"
+
+        if ($restartReqd -gt 0) {
+            Resume-AfterRestart -ResumeScript "InitMachine.ps1"
+        }
+    }
 }
 
 $WebManager = Get-IISServerManager
@@ -104,47 +201,47 @@ function Confirm-ValidAppPoolName{
         [ValidateNotNullOrEmpty()]
         $Name
     )
-    $invalidCharTests = @{}
-    $invalidAppPoolCharsRegex | % { $invalidCharTests.Add($_, ($Name -match [Regex]::Escape($_))) }
-    $illegalChars = ($invalidCharTests.GetEnumerator() | ? { $_.Value -eq $true}) | % {$_.Key}
+    Process {
+        $invalidCharTests = @{}
+        $invalidAppPoolCharsRegex | ForEach-Object { $invalidCharTests.Add($_, ($Name -match [Regex]::Escape($_))) }
+        $illegalChars = ($invalidCharTests.GetEnumerator() | Where-Object { $_.Value -eq $true}) | ForEach-Object {$_.Key}
 
-    if ($illegalChars.Count -gt 0) {
-        $illegalStr = [string]$illegalChars
-        Write-Error "$Name is not a valid application pool name: invalid characters: $illegalStr"
-        return $false
+        if ($illegalChars.Count -gt 0) {
+            $illegalStr = [string]$illegalChars
+            Write-Error "$Name is not a valid application pool name: invalid characters: $illegalStr"
+            return $false
+        }
+
+        $true
     }
-
-    return $true
 }
+
 function New-AppPool {
     [CmdletBinding()]
     Param(
         [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
         [String]
-        [ValidateNotNullOrEmpty()]
+        [ValidateScript({ Confirm-ValidAppPoolName -Name $Name })]
         $Name,
         [Parameter(Mandatory = $false)]
         [Switch]
         $Force
     )
+    Process {
+        Write-Verbose "Creating application pool $Name..."
+        $exists = Test-Path "IIS:\AppPools\$Name"
 
-    Write-Verbose "Creating application pool $Name..."
-    $exists = Test-Path "IIS:\AppPools\$Name"
+        if ($exists -and -not $Force ) {
+            Write-Error "Application pool $Name already exists and -Force was not specified. Application pool may be configured incorrectly."
+            return
+        }
+        elseif ($exists -and $Force) {
+            Uninstall-CIisAppPool -Name $Name
+        }
 
-    if ($exists -And -Not $Force ) {
-        Write-Error "Application pool $Name already exists and -Force was not specified. Application pool may be configured incorrectly."
-        return
+        Install-CIisAppPool -Name $Name
+        Write-Verbose "Creating application pool $Name...DONE"
     }
-    elif ($exists -and $Force) {
-        Uninstall-CIisAppPool -Name $Name
-    }
-
-    if (-not (Confirm-ValidAppPoolName -Name $Name)) {
-        return
-    }
-
-    Install-CIisAppPool -Name $Name
-    Write-Verbose "Creating application pool $Name...DONE"
 }
 
 function New-Website {
@@ -154,26 +251,26 @@ function New-Website {
         [String]
         [ValidateNotNullOrEmpty()]
         $Name,
-        [Parameter(Mandatory = $true, Position = 1)]
+        [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true)]
         [String]
         [ValidateNotNullOrEmpty()]
         $Path,
-        [Parameter(Mandatory = $true, Position = 2)]
+        [Parameter(Mandatory = $true, Position = 2, ValueFromPipelineByPropertyName = $true)]
         [String]
         [ValidateNotNullOrEmpty()]
         $Host,
-        [Parameter(Mandatory = $true, Position = 3)]
-        [Int]
+        [Parameter(Mandatory = $true, Position = 3, ValueFromPipelineByPropertyName = $true)]
+        [Int32]
         [ValidateRange(0, 65535)]
         $Port,
-        [Parameter(Mandatory = $false, Position = 4)]
+        [Parameter(Mandatory = $false, Position = 4, ValueFromPipelineByPropertyName = $true)]
         [String]
         [ValidateSet("http", "https")]
         $Protocol="http",
-        [Parameter(Mandatory = $false)]
+        [Parameter(Mandatory = $false, ValueFromPipelineByPropertyName = $true)]
         [String]
         $AppPoolName = $Name,
-        [Parameter(Mandatory = $false)]
+        [Parameter(Mandatory = $false, ValueFromPipelineByPropertyName = $true)]
         [String]
         $IpAddress = "*",
         [Parameter(Mandatory = $false)]
@@ -186,6 +283,7 @@ function New-Website {
             $thumbprintAttr.Mandatory = $true
             $thumbprintAttr.HelpMessage = "Specify the MD5 thumbprint for the certificate to be associated with this site's binding."
             $thumbprintAttr.Position = 5
+            $thumbprintAttr.ValueFromPipelineByPropertyName = $true
             $lengthAttr = New-Object -TypeName System.Management.Automation.ValidateLengthAttribute(40, 40)
 
             $thumbprintAttrList = New-Object -TypeName System.Collections.ObjectModel.Collection[System.Attribute]
@@ -197,6 +295,7 @@ function New-Website {
             $locationAttr.Mandatory = $true
             $locationAttr.HelpMessage = "Specify the name of the certificate store where the specified certificate lives."
             $locationAttr.Position = 6
+            $locationAttr.ValueFromPipelineByPropertyName = $true
             $locationSetAttr = New-Object -TypeName System.Management.Automation.ValidateSetAttribute("TrustedPublisher", "Root", "TrustedDevices", "My", "CA", "AuthRoot", "TrustedPeople", "My", "SmartCardRoot", "Trust", "Homegroup Machine Certificates")
 
             $locationAttrList = New-Object -TypeName System.Collections.ObjectModel.Collection[System.Attribute]
@@ -218,12 +317,12 @@ function New-Website {
         Install-CDirectory -Path $Path
         Write-Verbose "Verifying physical path $Path exists...DONE"
 
-        $existing = (Get-CIisWebsite -Name $Name).Length
-        if ($existing -ne 0 -and -not $Force) {
+        $existing = $null -eq (Get-CIisWebsite -Name $Name)
+        if ($existing -and -not $Force) {
             Write-Error "Site $Name already exists and the -Force switch was not passed. The site may not be configured properly."
             return
         }
-        elif ($existing) {
+        elseif ($existing) {
             Write-Verbose "Site $Name already exists; removing site..."
             Uninstall-CIisWebsite -Name $Name
             Write-Verbose "Site $Name already exists; removing site...DONE"
@@ -252,7 +351,7 @@ function New-Website {
                 return
             }
 
-            $siteParams.Add('CertificateThumbPrint', $PSBoundParameters.CertThumbprint)
+            $siteParams.Add('CertificateThumbPrint', $thumb)
             $siteParams.Add('CertStoreLocation', "Cert:\$PSBoundParameters.CertStoreLocation")
             Write-Verbose "Validating certificate $certPath for use with HTTPS binding on site $Name...DONE"
         }
@@ -261,7 +360,7 @@ function New-Website {
         $site = New-IISSite @siteParams
         Write-Verbose "Creating site $Name...DONE"
 
-        if ((Get-IISAppPool -Name $AppPoolName).Length -eq 0) {
+        if ($null -eq (Get-IISAppPool -Name $AppPoolName)) {
             Write-Error "Cannot set application pool for site ${Name}: application pool $AppPoolName does not exist."
             return
         }
@@ -269,7 +368,6 @@ function New-Website {
         $site.Applications['/'].ApplicationPoolName = $AppPoolName
         Write-Verbose "Set application pool $AppPoolName for site $Name"
         $site.ServerAutoStart = $true
-
         Write-Verbose "Starting site $Name..."
         $site.Start()
         Write-Verbose "Starting site $Name...DONE. Listening on $bindExpr"
@@ -286,10 +384,12 @@ function Get-EnumValues {
         [ValidateNotNullOrEmpty()]
         $Enum
     )
-    $enumValues = @{}
-    [enum]::GetValues([type]$Enum) | % { $enumValues.Add($_, $_.value__) }
+    Process {
+        $enumValues = @{}
+        [enum]::GetValues([type]$Enum) | ForEach-Object { $enumValues.Add($_, $_.value__) }
 
-    return $enumValues
+        $enumValues
+    }
 }
 
 function startSite($name) {
@@ -317,17 +417,15 @@ function Start-Sites {
         [String[]]
         $Name
     )
+    Process {
+        if ($Name.Length -eq 0) {
+            $Name = Get-IISSite
+        }
 
-    if ($Name.Length -eq 0) {
-        Write-Verbose "Starting all sites..."
-        Get-IISSite | % { startSite $_ }
-        Write-Verbose "Starting all sites...DONE"
-        return
+        Write-Verbose "Starting selected sites..."
+        $Name | ForEach-Object { startSite $_ }
+        Write-Verbose "Starting selected sites...DONE"
     }
-
-    Write-Verbose "Starting selected sites..."
-    $Name | % { startSite $_ }
-    Write-Verbose "Starting selected sites...DONE"
 }
 
 
@@ -356,17 +454,15 @@ function Stop-Sites {
         [String[]]
         $Name
     )
+    Process {
+        if ($Name.Length -eq 0) {
+            $Name = Get-IISSite
+        }
 
-    if ($Name.Length -eq 0) {
-        Write-Verbose "Stopping all sites..."
-        Get-IISSite | % { stopSite $_ }
-        Write-Verbose "Stopping all sites...DONE"
-        return
+        Write-Verbose "Stopping selected sites..."
+        $Name | ForEach-Object { stopSite $_ }
+        Write-Verbose "Stopping selected sites...DONE"
     }
-
-    Write-Verbose "Stopping selected sites..."
-    $Name | % {	stopSite $_ }
-    Write-Verbose "Stopping selected sites...DONE"
 }
 
 function recycleAppPool($name) {
@@ -391,14 +487,11 @@ function Restart-AppPools {
     )
 
     if ($Name.Length -eq 0) {
-        Write-Verbose "Recycling all application pools..."
-        IISAdministration\Get-IISAppPool | % { recycleAppPool $_ }
-        Write-Verbose "Recycling all application pools...DONE"
-        return
+        $Name = IISAdministration\Get-IISAppPool
     }
 
     Write-Verbose "Recycling selected application pools..."
-    $Name | % { recycleAppPool $_ }
+    $Name | ForEach-Object { recycleAppPool $_ }
     Write-Verbose "Recycling selected application pools...DONE"
 }
 
@@ -423,156 +516,168 @@ function Remove-Sites {
         [String[]]
         $Name
     )
-    Write-Verbose "Removing selected sites..."
-    $Name | % { removeSite $_ }
-    $WebManager.CommitChanges()
-    Write-Verbose "Removing selected sites...DONE"
+    Process {
+        Write-Verbose "Removing selected sites..."
+        $Name | ForEach-Object { removeSite $_ }
+        $WebManager.CommitChanges()
+        Write-Verbose "Removing selected sites...DONE"
+    }
 }
 
 function New-TrustedSelfSignedCert {
     [CmdletBinding()]
     Param(
-        [Parameters(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
         [ValidateNotNullOrEmpty()]
         [String]
         $Name,
-        [Parameter(Mandatory = $true, Position = 2, ValueFromPipeline = $true)]
+        [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true)]
         [String]
-        [ValidateNotNullOrEmpty()]
+        [ValidateScript({ Test-Directory -Path $_ -PathType Container -IsValid})]
         $ExportDirectory,
-        [Parameter(Mandatory = $false, Position = 3)]
+        [Parameter(Mandatory = $false, Position = 2, ValueFromPipelineByPropertyName = $true)]
         [datetime]
-        [ValidateScript({ $_ -gt (Get-Date)})]
+        [ValidateScript({ $_ -gt (Get-Date) })]
         $expiration = (Get-Date).AddYears(1),
-        [Parameter(Mandatory = $false, Position = 4)]
+        [Parameter(Mandatory = $false, Position = 3, ValueFromPipelineByPropertyName = $true)]
         [Int32]
         [ValidateRange("Positive")]
         $KeyLength = 2048
     )
+    Process {
+        Write-Verbose "Generating certificate..."
+
+        Write-Verbose "Ensuring directory $ExportDirectory exists..."
+        Install-CDirectory $ExportDirectory
+        Write-Verbose "Ensuring directory $ExportDirectory exists...DONE"
+
+        Write-Verbose "Generating X509 cert..."
+        $rootCert = New-SelfSignedCertificate -DnsName $Name -KeyLength $KeyLength -KeyAlgorithm 'RSA' -HashAlgorithm 'SHA256' \
+        -KeyExportPolicy 'Exportable' -NotAfter $expiration -CertStoreLocation "Cert:\LocalMachine\My" \
+        -KeyUsage 'CertSign','CRLSign' -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.1") -FriendlyName $Name
+        Write-Verbose "Generating X509 cert...DONE"
+        $rootFile = Join-Path -Path $ExportDirectory -ChildPath "$Name.crt"
+
+        Write-Verbose "Exporting public key of certificate to $rootFile..."
+        Export-Certificate -Cert $rootCert -FilePath $rootFile
+        Write-Verbose "Exporting public key of certificate to $rootFile...DONE"
+
+        Write-Verbose "Importing certificate into trusted root store..."
+        Import-Certificate -CertStoreLocation 'Cert:\LocalMachine\Root' -FilePath $rootFile
+        Write-Verbose "Importing certificate into trusted root store...DONE"
+
+        Write-Verbose "Generating certificate ${rootCert.Thumbprint}...DONE"
+
+        $rootCert.Thumbprint
+    }
+}
+
+function New-SelfSignedTlsCert {
+  [CmdletBinding()]
+  Param(
+    [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+    [ValidateNotNullOrEmpty()]
+    [String]
+    $Name,
+    [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true)]
+    [String]
+    [ValidateNotNullOrEmpty()]
+    $DnsName,
+    [Parameter(Mandatory = $true, Position = 2, ValueFromPipelineByPropertyName = $true)]
+    [String]
+    [ValidateScript({ Test-Directory -Path $_ -PathType Container -IsValid })]
+    $ExportDirectory,
+    [Parameter(Mandatory = $true, Position = 3, ValueFromPipelineByPropertyName = $true)]
+    [String]
+    [ValidateNotNullOrEmpty()]
+    $SignerThumbprint,
+    [Parameter(Mandatory = $true, Position = 4, ValueFromPipelineByPropertyName = $true)]
+    [securestring]
+    [ValidateNotNullOrEmpty()]
+    $Password,
+    [Parameter(Mandatory = $false, Position = 5, ValueFromPipelineByPropertyName = $true)]
+    [datetime]
+    [ValidateScript( { $_ -gt (Get-Date) })]
+    $expiration = (Get-Date).AddYears(1),
+    [Parameter(Mandatory = $false, Position = 6, ValueFromPipelineByPropertyName = $true)]
+    [Int32]
+    [ValidateRange("Positive")]
+    $KeyLength = 2048
+  )
+  Process {
     Write-Verbose "Generating certificate..."
 
     Write-Verbose "Ensuring directory $ExportDirectory exists..."
     Install-CDirectory $ExportDirectory
     Write-Verbose "Ensuring directory $ExportDirectory exists...DONE"
 
+    Write-Verbose "Fetching trusted signing certificate with thumbprint $SignerThumbprint..."
+    $rootCA = Get-ChildItem "Cert:\LocalMachine\Root\$SignerThumprint"
+
+    if ($null -eq $rootCA) {
+        Write-Error "No trusted cert with thumbprint $SignerThumbprint was found."
+        return
+    }
+
     Write-Verbose "Generating X509 cert..."
-    $rootCert = New-SelfSignedCertificate -DnsName $Name -KeyLength $KeyLength -KeyAlgorithm 'RSA' -HashAlgorithm 'SHA256' \
-    -KeyExportPolicy 'Exportable' -NotAfter $expiration -CertStoreLocation "Cert:\LocalMachine\My" \
-    -KeyUsage 'CertSign','CRLSign' -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.1") -FriendlyName $Name
+    $localCert = New-SelfSignedCertificate -DnsName $DnsName -KeyLength $KeyLength -KeyAlgorithm 'RSA' -HashAlgorithm 'SHA256' \
+    -KeyExportPolicy 'Exportable' -NotAfter $expiration -CertStoreLocation "Cert:\LocalMachine\My" -Signer $rootCA \
+    -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.1") -FriendlyName "$Name self-signed local cert"
     Write-Verbose "Generating X509 cert...DONE"
-    $rootFile = Join-Path -Path $ExportDirectory -ChildPath "$Name.crt"
+    $certFile = Join-Path -Path $ExportDirectory -ChildPath "$Name.crt"
+    $certExportFile = Join-Path $ExportDirectory -ChildPath "$Name.pfx"
 
-    Write-Verbose "Exporting public key of certificate to $rootFile..."
-    Export-Certificate -Cert $rootCert -FilePath $rootFile
-    Write-Verbose "Exporting public key of certificate to $rootFile...DONE"
+    Write-Verbose "Exporting certificate and key to $rootFile..."
+    Export-Certificate -Cert $localCert -FilePath $certFile
+    Export-PfxCertificate -Cert $localCert -FilePath $certExportFile -Password $Password
+    Write-Verbose "Exporting public key and pfx of certificate to $rootFile...DONE"
 
-    Write-Verbose "Importing certificate into trusted root store..."
-    Import-Certificate -CertStoreLocation 'Cert:\LocalMachine\Root' -FilePath $rootFile
-    Write-Verbose "Importing certificate into trusted root store...DONE"
+    Write-Verbose "Generating certificate ${localCert.Thumbprint}...DONE"
 
-    Write-Verbose "Generating certificate ${rootCert.Thumbprint}...DONE"
-
-    $rootCert.Thumbprint
+    $localCert.Thumbprint
 }
-
-function New-SelfSignedTlsCert {
-  [CmdletBinding()]
-  Param(
-    [Parameters(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
-    [ValidateNotNullOrEmpty()]
-    [String]
-    $Name,
-    [Parameter(Mandatory = $true, Position = 1)]
-    [String]
-    [ValidateNotNullOrEmpty()]
-    $DnsName,
-    [Parameter(Mandatory = $true, Position = 2, ValueFromPipeline = $true)]
-    [String]
-    [ValidateNotNullOrEmpty()]
-    $ExportDirectory,
-    [Parameter(Mandatory = $true, Position = 3, ValueFromPipeline = $true)]
-    [String]
-    [ValidateNotNullOrEmpty()]
-    $SignerThumbprint,
-    [Parameter(Mandatory = $true, Position = 4)]
-    [securestring]
-    [ValidateNotNullOrEmpty()]
-    $Password,
-    [Parameter(Mandatory = $false, Position = 4)]
-    [datetime]
-    [ValidateScript( { $_ -gt (Get-Date) })]
-    $expiration = (Get-Date).AddYears(1),
-    [Parameter(Mandatory = $false, Position = 4)]
-    [Int32]
-    [ValidateRange("Positive")]
-    $KeyLength = 2048
-  )
-  Write-Verbose "Generating certificate..."
-
-  Write-Verbose "Ensuring directory $ExportDirectory exists..."
-  Install-CDirectory $ExportDirectory
-  Write-Verbose "Ensuring directory $ExportDirectory exists...DONE"
-
-  Write-Verbose "Fetching trusted signing certificate with thumbprint $SignerThumbprint..."
-  $rootCA = Get-ChildItem "Cert:\LocalMachine\Root\$SignerThumprint"
-
-  if ($null -eq $rootCA) {
-      Write-Error "No trusted cert with thumbprint $SignerThumbprint was found."
-      return
-  }
-
-  Write-Verbose "Generating X509 cert..."
-  $localCert = New-SelfSignedCertificate -DnsName $DnsName -KeyLength $KeyLength -KeyAlgorithm 'RSA' -HashAlgorithm 'SHA256' \
-  -KeyExportPolicy 'Exportable' -NotAfter $expiration -CertStoreLocation "Cert:\LocalMachine\My" -Signer $rootCA
-  -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.1") -FriendlyName "$Name self-signed local cert"
-  Write-Verbose "Generating X509 cert...DONE"
-  $certFile = Join-Path -Path $ExportDirectory -ChildPath "$Name.crt"
-  $certExportFile = Join-Path $ExportDirectory -ChildPath "$Name.pfx"
-
-  Write-Verbose "Exporting certificate and key to $rootFile..."
-  Export-Certificate -Cert $localCert -FilePath $certFile
-  Export-PfxCertificate -Cert $localCert -FilePath $certExportFile -Password $Password
-  Write-Verbose "Exporting public key and pfx of certificate to $rootFile...DONE"
-
-  Write-Verbose "Generating certificate ${localCert.Thumbprint}...DONE"
-
-  $localCert.Thumbprint
 }
 
 function Install-Chocolatey {
     [CmdletBinding()]
     Param()
-    Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+    Process {
+        Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+    }
 }
 
 function Install-ChocolateyPackage {
-    [CmdletBInding()]
+    [CmdletBinding()]
     Param(
-        [Parameter(Mandatory = $true, Position = 0)]
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
         [String]
         [ValidateNotNullOrEmpty()]
         $PackageName,
-        [Parameter(Mandatory = $false, Position = 1)]
+        [Parameter(Mandatory = $false, Position = 1, ValueFromPipelineByPropertyName = $true)]
         [String]
         $Parameters
     )
-    $cmd = "choco install $PackageName -y"
+    Process {
+        $cmd = "choco install $PackageName -y"
 
-    if (-not [string]::IsNullOrWhiteSpace($Parameters)) {
-        $cmd += " --parameters $Parameters"
+        if (-not [string]::IsNullOrWhiteSpace($Parameters)) {
+            $cmd += " --parameters $Parameters"
+        }
     }
 }
 
 function Assert-ProgramInstalled {
     [CmdletBinding()]
     Param(
-        [Parameter(Mandatory = $true, Position = 0)]
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
         [string]
         [ValidateNotNullOrEmpty()]
         $ProgramName,
+        [Parameter(Mandatory = $false)]
         [switch]
         $Wildcard
     )
+    Process {
     Write-Verbose "Searching for an installation record of program $ProgramName"
 
     $name = $ProgramName
@@ -584,11 +689,12 @@ function Assert-ProgramInstalled {
 
     $null -ne $results -and $results.Count -gt 0
 }
+}
 
 function Assert-CommandPresent {
     [CmdletBinding()]
     Param(
-        [Parameter(Mandatory = $true, Position = 0)]
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
         [string]
         [ValidateNotNullOrEmpty()]
         $Command
@@ -601,87 +707,92 @@ function Assert-CommandPresent {
 }
 
 function New-IisApplication {
-    [CMdletBinding()]
+    [CmdletBinding()]
     Param(
-        [Parameter(Mandatory = $true, Position = 0)]
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
         [string]
-        [ValidateNotNullOrEmpty()]
+        [ValidateScript({ Test-CIisWebsite -Name $ParentSiteName })]
         $ParentSiteName,
-        [Parameter(Mandatory = $true, Position = 1)]
+        [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true)]
         [string]
         [ValidateNotNullOrEmpty()]
         $AppName,
-        [Parameter(Mandatory = $true, Position = 2)]
+        [Parameter(Mandatory = $true, Position = 2, ValueFromPipelineByPropertyName = $true)]
         [string]
-        [ValidateNotNullOrEmpty()]
+        [ValidateScript({ Test-CIisAppPool -Name $_ })]
         $AppPoolName,
-        [Parameter(Mandatory = $true, Position = 3)]
+        [Parameter(Mandatory = $true, Position = 3, ValueFromPipelineByPropertyName = $true)]
         [string]
         [ValidateScript( { Test-Path -Path $_ -IsValid })]
         $AppPath,
+        [Parameter(Mandatory = $false)]
         [switch]
         $Force
     )
-    Write-Verbose "Creating IIS Application $AppName within site $ParentSiteName..."
+    Process {
+        Write-Verbose "Creating IIS Application $AppName within site $ParentSiteName..."
 
-    $site = Get-CIisWebsite -Name $ParentSiteName
+        $site = Get-CIisWebsite -Name $ParentSiteName
 
-    if ($null -eq $site) {
-        Write-Error "Website $ParentSiteName does not exist."
-        return
+        if ($null -eq $site) {
+            Write-Error "Website $ParentSiteName does not exist."
+            return
+        }
+
+        $existingApp = $site.Applications | Where-Object { $_.Path -eq "/$AppName"}
+
+        if ($null -ne $existingApp -and (-not $Force)) {
+            Write-Error "Application already exists at virtual path /$AppName for site $ParentSiteName. Specify -Force switch to remove."
+            return
+        }
+        elseif ($null -ne $existingApp) {
+            Write-Verbose "Application already exists at path /$AppName of site $ParentSiteName and will be removed."
+            $manager = $existingApp.ServerManager
+            $existingApp.Delete()
+            $manager.CommitChanges()
+            Write-Verbose "Application at path /$AppName deleted successfully."
+        }
+
+        $pool = Get-CIisAppPool -Name $AppPoolName
+
+        if ($null -eq $pool) {
+            Write-Error "Application pool $AppPoolName does not exist."
+            return
+        }
+
+        Install-CIisApplication -SiteName $ParentSiteName -VirtualPath $AppName -PhysicalPath $AppPath -AppPoolName $AppPoolName
+        Write-Verbose "Creating IIS Application $AppName within site $ParentSiteName...DONE"
     }
-
-    $existingApp = $site.Applications | Where-Object { $_.Path -eq "/$AppName"}
-
-    if ($null -ne $existingApp -and (-not $Force)) {
-        Write-Error "Application already exists at virtual path /$AppName for site $ParentSiteName. Specify -Force switch to remove."
-        return
-    }
-    elseif ($null -ne $existingApp) {
-        Write-Verbose "Application already exists at path /$AppName of site $ParentSiteName and will be removed."
-        $manager = $existingApp.ServerManager
-        $existingApp.Delete()
-        $manager.CommitChanges()
-        Write-Verbose "Application at path /$AppName deleted successfully."
-    }
-
-    $pool = Get-CIisAppPool -Name $AppPoolName
-
-    if ($null -eq $pool) {
-        Write-Error "Application pool $AppPoolName does not exist."
-        return
-    }
-
-    Install-CIisApplication -SiteName $ParentSiteName -VirtualPath $AppName -PhysicalPath $AppPath -AppPoolName $AppPoolName
-    Write-Verbose "Creating IIS Application $AppName within site $ParentSiteName...DONE"
 }
 
 function Invoke-XdtTransform {
     [CmdletBinding()]
     Param(
-        [Parameter(Mandatory = $true, Position = 0)]
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
         [string]
         [ValidateScript( { Test-Path $_ })]
         $WebConfigFile,
-        [Parameter(Mandatory = $true, Position = 1)]
+        [Parameter(Mandatory = $true, Position = 1, ValueFromPipelineByPropertyName = $true)]
         [string]
         [ValidateScript( { Test-Path $_ })]
         $TransformFile,
-        [Parameter(Mandatory = $true, Position = 2)]
+        [Parameter(Mandatory = $true, Position = 2, ValueFromPipelineByPropertyName = $true)]
         [string]
         [ValidateScript( { Test-Path $_ -IsValid })]
         $WebConfigDestinationPath
     )
-    $ConvertParams = @{
-        Path = $WebConfigFile
-        XdtPath = $TransformFile
-        Destination = $WebConfigDestinationPath
-        Verbose = $Verbose
-    }
+    Process {
+        $ConvertParams = @{
+            Path = $WebConfigFile
+            XdtPath = $TransformFile
+            Destination = $WebConfigDestinationPath
+            Verbose = $Verbose
+        }
 
-    Write-Verbose "Applying XDT Transform $TransformFile to web.config in directory $WebConfigDestinationPath"
-    Convert-CXmlFile @ConvertParams
-    Write-Verbose "$WebConfigDestinationPath transformed successfully via file $TransformFile"
+        Write-Verbose "Applying XDT Transform $TransformFile to web.config in directory $WebConfigDestinationPath"
+        Convert-CXmlFile @ConvertParams
+        Write-Verbose "$WebConfigDestinationPath transformed successfully via file $TransformFile"
+    }
 }
 
 Enum NetFrameworkVersions {
@@ -716,6 +827,25 @@ Enum NetFrameworkMinimumVersions {
     NET471 = 461308
     NET472 = 461808
     NET48 = 528040
+}
+
+function Get-NetFxVersion {
+    [CmdletBinding()]
+    Param()
+    Process {
+        Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP' -Recurse |
+            Get-ItemProperty -Name Version, Release -ErrorAction 0 |
+            Where-Object { $_.PSChildName -match '^(?![SW])\p{L}'} |
+            Select PSChildName, Version, Release, @{
+                name = "Product"
+                expression = {
+                    switch ($_.Release) {
+
+                    }
+                }
+            }
+
+    }
 }
 
 function Get-RegistryKey {
@@ -995,6 +1125,16 @@ function Invoke-DisposableScope {
         }
     }
 }
+
+function Get-VisualStudioBootstrapper {
+    [CmdletBinding()]
+    Param()
+    Process {
+        $tempDir = New-CTempDirectory -Prefix 'n3'
+        Invoke-WebRequest 'https://visualstudio.microsoft.com/thank-you-downloading-visual-studio/?sku=enterprise&rel=16&utm_medium=microsoft&utm_source=docs.microsoft.com&utm_campaign=link+cta&utm_content=download+commandline+parameters+vs2019+rc#' -OutFile c:\file.ext
+    }
+}
+
 function Get-WebPageContent {
     [CmdletBinding()]
     Param(
@@ -1189,5 +1329,31 @@ function Update-EnvironmentVariable {
             }
         }
     }
+}
 
+function Install-Scoop {
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $false, Position = 0, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType container -IsValid})]
+        $InstallDirectory = $null,
+        [Parameter(Mandatory = $false, Position = 1, ValueFromPipelineByPropertyName = $true)]
+        [string]
+        [ValidateScript({ Test-Path -Path $_ -PathType Container -IsValid })]
+        $GlobalProgramDirectory = $null
+    )
+    Process {
+        if ($null -ne $InstallDirectory) {
+            $env:SCOOP = $InstallDirectory
+            [System.Environment]::SetEnvironmentVariable('SCOOP', $env:SCOOP, 'User')
+        }
+
+        if ($null -ne $GlobalProgramDirectory) {
+            $env:SCOOP_GLOBAL = $GlobalProgramDirectory
+            [System.Environment]::SetEnvironmentVariable('SCOOP_GLOBAL', $env:SCOOP_GLOBAL, 'Machine')
+        }
+
+        Invoke-Expression (New-Object net.WebClient).DownloadString('https://get.scoop.sh')
+    }
 }
