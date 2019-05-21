@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 5.0
 #Requires -Modules PSReadLine, PowerShellGet, posh-git, IISAdministration, DockerMsftProvider, VSSetup, MSI, Pscx, Carbon
 #Requires -RunAsAdministrator
 
@@ -124,7 +124,7 @@ function Install-WinFeature {
     Process {
         if ($null -eq (Get-WindowsOptionalFeature -Online -FeatureName $Name | Where-Object { $_.Status -eq 'Enabled' })) {
             Write-Verbose "Installing Windows Feature $Name and dependencies..."
-            $result = Enable-WindowsOptionalFeature -Online -FeatureName $Name -All -NoRestart -WarningAction SilentlyContinueow
+            $result = Enable-WindowsOptionalFeature -Online -FeatureName $Name -All -NoRestart -WarningAction  SilentlyContinueow
             Write-Verbose "Installing Windows Feature $Name and dependencies...DONE"
             if ($result.RestartNeeded) { 1 } else { 0 }
         }
@@ -167,9 +167,7 @@ function Install-IIS {
         & "C:\Program Files\Microsoft\Web Platform Installer\WebpiCmd-x64.exe" /install /Products:WDeployNoSMO /AcceptEULA /SuppressPostFinish
         Write-Verbose "Installing Web Platform Installer...DONE" -Verbose
 
-        if ($restartReqd -gt 0) {
-            Resume-AfterRestart -ResumeScript "InitSites.ps1"
-        }
+        $restartReqd -gt 0
     }
 }
 
@@ -183,9 +181,7 @@ function Install-HyperV {
         $restartReqd += Install-WinFeature "Microsoft-Hyper-V-All"
         Write-Verbose "Installing Windows components for HyperV and containers...DONE"
 
-        if ($restartReqd -gt 0) {
-            Resume-AfterRestart -ResumeScript "InitMachine.ps1"
-        }
+        $restartReqd -gt 0
     }
 }
 
